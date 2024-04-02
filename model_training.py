@@ -6,6 +6,9 @@ from sklearn.model_selection import train_test_split
 # Load the labeled network traffic data from the CSV file
 data = pd.read_csv("network_traffic.csv")
 
+# Remove the 'Time' column
+data = data.drop(["Time"], axis=1)
+
 # Separate features and labels
 X = data.drop(["Is Attack"], axis=1)
 y = data["Is Attack"]
@@ -46,7 +49,7 @@ X["Packet Dropped"] = X["Packet Dropped"] / packet_dropped_weight  # Revert the 
 predictions = model.predict(X)
 
 # Convert the predictions to binary labels (-1 for anomaly, 1 for normal)
-predictions_binary = [1 if pred == 1 else 0 for pred in predictions]
+predictions_binary = [0 if pred == 1 else 1 for pred in predictions]
 
 # Create a DataFrame with the original data and predicted labels
 results = pd.DataFrame(data)
