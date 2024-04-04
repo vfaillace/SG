@@ -11,14 +11,9 @@ Attack Identification: Performs further analysis on the isolated anomalous packe
 Integration and Testing: Integrates the attack identification component with other system components and tests the end-to-end functionality.
 
 **Installation**
-Clone the repository:
-    git clone https://github.com/vfaillace/SG
-Install the required dependencies:
-    pip install -r requirements.txt
-Generate simulated network traffic data:
-    python sim_dos_traffic.py
-Train the isolation forest model:
-    python model_training.py
-
+Clone the repository: git clone https://github.com/vfaillace/SG
+Install the required dependencies: pip install -r requirements.txt
+Generate simulated network traffic data: python sim_dos_traffic.py
+Train the isolation forest model: python model_training.py
 **Contact**
 For any questions or inquiries, please contact vfaillace@ufl.edu
