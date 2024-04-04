@@ -1,4 +1,4 @@
-Smart Grid Anomaly Detection
+Smart Grid Anomaly Detection\
 This project aims to develop a system for identifying cyber attacks on a smart grid network using machine learning techniques. The system simulates normal network traffic data and various attack scenarios, trains an isolation forest model for anomaly detection, and provides insights into the detected attacks.
 
 **Project Structure**\
