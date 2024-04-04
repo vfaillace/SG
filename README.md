@@ -10,7 +10,7 @@ Model Evaluation: Evaluates the trained model using appropriate metrics and anal
 Attack Identification: Performs further analysis on the isolated anomalous packets to gain insights into the attack vector and targeted entities.\ 
 Integration and Testing: Integrates the attack identification component with other system components and tests the end-to-end functionality. \ 
 
-**Installation**
+**Installation** \
 Clone the repository: git clone https://github.com/vfaillace/SG \
 Install the required dependencies: pip install -r requirements.txt \
 Generate simulated network traffic data: python sim_dos_traffic.py \
