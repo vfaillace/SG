@@ -10,6 +10,10 @@ import pandas as pd
 import csv
 import threading
 import matplotlib.pyplot as plt
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from SimComponents import PacketGenerator, PacketSink, SwitchPort, PortMonitor
 
 # Global variable definition
 time_s = datetime.now()

@@ -3,12 +3,16 @@ import functools
 from datetime import datetime
 import time as time_module
 import simpy
-from SimComponents import PacketGenerator, PacketSink, SwitchPort, PortMonitor
 import numpy as np
 import pandas as pd
 import csv
 import threading
 import queue
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from M2.SimComponents import PacketGenerator, PacketSink, SwitchPort, PortMonitor
+
 
 import time
 # Global variable definition

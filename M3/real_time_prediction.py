@@ -10,6 +10,7 @@ import joblib
 from sklearn.preprocessing import LabelEncoder
 import simulation_script
 
+
 # Load the trained model
 model = joblib.load("decision_tree_model.pkl")
 
