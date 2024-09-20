@@ -18,6 +18,7 @@ model = joblib.load("decision_tree_model.pkl")
 le_source = LabelEncoder()
 le_target = LabelEncoder()
 
+start_time = None
 # Create the main window
 root = tk.Tk()
 root.title("Real-time Network Visualization")
@@ -50,7 +51,7 @@ canvas.get_tk_widget().pack()
 lines = {}
 colors = ['blue', 'orange', 'green', 'red']
 fb_tb_combinations = [(i, j) for i in range(1, 4) for j in range(1, 4) if i != j]
-#fb_tb_combinations = [(1,2), (2,1)]
+# fb_tb_combinations = [(1,2), (2,1)]
 
 # Create a dictionary to store data for each FB-TB combination
 data_storage = {combo: pd.DataFrame() for combo in fb_tb_combinations}
@@ -68,20 +69,36 @@ attack_ax.set_ylim(0, 1)
 # Create a queue for communication between threads
 data_queue = queue.Queue()
 
+
 def parse_custom_datetime(time_str):
-    return datetime.strptime(time_str, "%H:%M:%S:%f")
+    # Use a recent date as default (e.g., January 1, 2024)
+    default_date = datetime(2024, 1, 1).date()
+    parsed_time = datetime.strptime(time_str, "%H:%M:%S:%f")
+    return datetime.combine(default_date, parsed_time.time())
+
 
 def process_sample(data):
     # Convert data to DataFrame
     df = pd.DataFrame([data])
 
-    # Preprocess the data
-    parsed_time = parse_custom_datetime(df["Time"].iloc[0])
-    df["Hour"] = parsed_time.hour
-    df["Minute"] = parsed_time.minute
-    df["Second"] = parsed_time.second
-    df["Microsecond"] = parsed_time.microsecond
-    df["Seconds"] = parsed_time.timestamp()
+    time_str = df["Time"].iloc[0]
+    try:
+        parsed_time = parse_custom_datetime(time_str)
+        print(f"Original time string: {time_str}")
+        print(f"Parsed time: {parsed_time}")
+
+        df["Hour"] = parsed_time.hour
+        df["Minute"] = parsed_time.minute
+        df["Second"] = parsed_time.second
+        df["Microsecond"] = parsed_time.microsecond
+
+        epoch = datetime(1970, 1, 1)
+        df["Seconds"] = (parsed_time - epoch).total_seconds()
+    except Exception as e:
+        print(f"Error processing time: {str(e)}")
+        print(f"Original time string: {time_str}")
+        df["Hour"] = df["Minute"] = df["Second"] = df["Microsecond"] = 0
+        df["Seconds"] = 0
 
     # Ensure 'Arrival Time' and 'Sample' columns are present
     if "Arrival Time" not in df.columns:
@@ -107,6 +124,7 @@ def process_sample(data):
     except Exception as e:
         print(f"Error making prediction: {str(e)}")
         return None
+
 
 def update_plots():
     current_time = datetime.now().timestamp()
