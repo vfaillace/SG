@@ -1092,7 +1092,8 @@ int main(int, char **)
         {
             if (ImGui::Button("Train Model"))
             {
-                trainModel("network_traffic.csv");
+
+                trainModel(std::filesystem::absolute("network_traffic.csv").string());
             }
         }
 
