@@ -39,14 +39,42 @@
 using json = nlohmann::json;
 #include <random>
 
+std::vector<std::thread> pythonScriptThreads;
+std::atomic<bool> applicationClosing(false);
+
+enum class AttackType
+{
+    NONE,
+    DDOS,
+    SYN_FLOOD,
+    MITM_SCADA
+};
+
+struct AttackInfo
+{
+    bool none;
+    bool ddos;
+    bool synflood;
+    bool mitm;
+};
+
+enum class TrafficType
+{
+    NORMAL,
+    DDOS,
+    SYN_FLOOD,
+    MITM_SCADA
+};
+
+TrafficType currentTrafficType = TrafficType::NORMAL;
+
+const char *attackLabels[] = {"None", "DDoS", "SYN Flood", "MITM"};
+
 struct PlotData
 {
     // std::map<std::pair<int, int>, std::vector<float>> time;
     std::map<std::pair<int, int>, std::vector<float>> values;
 };
-std::random_device rd;
-std::mt19937 gen(rd());
-std::uniform_int_distribution<> portDist(12348, 65535); // Range for dynamic port allocation
 struct ModelInfo
 {
     std::string name;
@@ -56,8 +84,17 @@ struct ModelInfo
     int port;
     ImVec4 color;
     std::vector<PlotData> plotData;
+    std::map<AttackType, float> attackAccuracy;
     ModelInfo() : plotData(1) {} // Initialize with one PlotData for predictions
 };
+std::vector<std::string> metricLabels = {
+    "Packets Dropped", "Average Queue", "System Occupancy", "Service Rate",
+    "TD", "RTT", "Arrival Rate", "Attack Type Distribution"};
+
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<> portDist(12348, 65535); 
+
 std::vector<ModelInfo> availableModels;
 std::mutex modelsMutex;
 struct pair_hash
@@ -70,11 +107,8 @@ struct pair_hash
         return h1 ^ h2;
     }
 };
-std::vector<std::string> metricLabels = {
-    "Packets Dropped", "Average Queue", "System Occupancy", "Service Rate",
-    "TD", "RTT", "Arrival Rate", "Attack Information"};
-// Update the number of plot data arrays and mutexes
-std::vector<PlotData> plotDataArray(9); // Now we have 9 metrics
+
+std::vector<PlotData> plotDataArray(9);
 std::vector<std::mutex> plotDataMutexes(9);
 std::unordered_map<std::pair<int, int>, int, pair_hash> fbTbCombinations;
 const int MAX_COMBINATIONS = 10; // Limit the number of FB-TB combinations we track
@@ -84,7 +118,7 @@ std::queue<std::vector<float>> dataQueue;
 std::vector<json> modelStats;
 std::mutex queueMutex;
 bool simulationRunning = false;
-bool simulationEnded = true;
+bool simulationEnded = false;
 bool includeDOS = true;       // Global variable to control DOS inclusion
 int totalSimulationTime = 20; // Default total simulation time in seconds
 int dosAttackTime = 10;       // Default DOS attack time in seconds
@@ -92,6 +126,9 @@ std::atomic<bool> stopSimulationRequested(false);
 // std::vector<std::mutex> plotDataMutexes(metricLabels.size());
 std::atomic<bool> receiverRunning(true);
 SOCKET predictionSocket = INVALID_SOCKET;
+std::atomic<bool> shouldExit(false);
+SOCKET listenSocket = INVALID_SOCKET;
+
 ImVec4 colors[] = {
     ImVec4(1.0f, 0.0f, 0.0f, 1.0f), // Red
     ImVec4(0.0f, 1.0f, 0.0f, 1.0f), // Green
@@ -104,7 +141,51 @@ ImVec4 colors[] = {
     ImVec4(0.0f, 0.5f, 0.5f, 1.0f), // Teal
     ImVec4(0.5f, 0.5f, 0.5f, 1.0f)  // Gray
 };
+
+const ImVec4 ATTACK_COLORS[] = {
+    ImVec4(0.5f, 0.5f, 0.5f, 1.0f), // Normal traffic (Grey)
+    ImVec4(1.0f, 0.0f, 0.0f, 1.0f), // DDoS (Red)
+    ImVec4(0.0f, 0.0f, 1.0f, 1.0f), // SYN Flood (Blue)
+    ImVec4(1.0f, 0.6f, 0.0f, 1.0f)  // MITM (Orange)
+};
+
 // Function to initialize Python
+
+void updateSimulationParameters()
+{
+    ImGui::InputInt("Total Simulation Time (s)", &totalSimulationTime);
+
+    static int selectedAttackType = 0;
+    const char *attackTypes[] = {"None", "DDoS", "SYN Flood", "MITM SCADA"};
+    ImGui::Combo("Attack Type", &selectedAttackType, attackTypes, IM_ARRAYSIZE(attackTypes));
+
+    if (selectedAttackType > 0)
+    {
+        ImGui::InputInt("Attack Duration (s)", &dosAttackTime);
+        if (dosAttackTime > totalSimulationTime)
+        {
+            dosAttackTime = totalSimulationTime;
+        }
+    }
+}
+
+void processPredictionResponse(ModelInfo &model, const json &response, const std::pair<int, int> &connection)
+{
+    float prediction = response["prediction"].get<float>();
+    std::string attackType = response["attack_type"].get<std::string>();
+    // std::cout << prediction << std::endl;
+    // std::cout << attackType << std::endl;
+
+    // Update plot data
+    model.plotData[0].values[connection].push_back(prediction);
+
+    // Limit the size of the plot data
+    if (model.plotData[0].values[connection].size() > 1000)
+    {
+        model.plotData[0].values[connection].erase(
+            model.plotData[0].values[connection].begin());
+    }
+}
 
 std::string openFileDialog(const char *filter = "Python Files\0*.py\0All Files\0*.*\0")
 {
@@ -140,6 +221,7 @@ void initAvailableModels()
     std::vector<std::string> modelNames = {
         "isolation_forest_model.pkl",
         "decision_tree_model.pkl",
+        "kmeans_model.pkl",
         "random_forest_model.pkl"};
     for (size_t i = 0; i < modelNames.size(); ++i)
     {
@@ -181,7 +263,6 @@ std::string getCurrentTimestamp()
     return ss.str();
 }
 
-// Update the trainModel function
 void trainModel(const std::string &csvPath)
 {
     std::string scriptPath = openFileDialog("Python Files\0*.py\0All Files\0*.*\0");
@@ -301,19 +382,56 @@ void closeModelSockets()
         }
     }
 }
+
+void terminatePythonProcesses()
+{
+    // Send termination command to all model sockets
+    for (auto &model : availableModels)
+    {
+        if (model.socket != INVALID_SOCKET)
+        {
+            try
+            {
+                json terminateCmd;
+                terminateCmd["command"] = "terminate";
+                std::string jsonStr = terminateCmd.dump() + "\n"; // Add newline for message completion
+                send(model.socket, jsonStr.c_str(), jsonStr.length(), 0);
+
+                // Wait briefly for the command to be sent
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                // Shutdown and close socket
+                shutdown(model.socket, SD_BOTH);
+                closesocket(model.socket);
+                model.socket = INVALID_SOCKET;
+            }
+            catch (...)
+            {
+                // Ignore cleanup errors
+            }
+        }
+    }
+
+    // On Windows, forcefully terminate Python processes if they're still running
+#ifdef _WIN32
+    std::system("taskkill /F /IM python.exe /T > nul 2>&1");
+#endif
+}
+
 void stopSimulation()
 {
-    // Stop the simulation and collect statistics
     simulationEnded = true;
+    simulationRunning = false;
     modelStats.clear();
     for (const auto &model : availableModels)
     {
-        if (model.selected)
+        if (model.selected && model.socket != INVALID_SOCKET)
         {
             json request;
             request["command"] = "get_stats";
-            std::string jsonStr = request.dump();
+            std::string jsonStr = request.dump() + "\n";
             send(model.socket, jsonStr.c_str(), jsonStr.length(), 0);
+
             char recvbuf[1024];
             int iResult = recv(model.socket, recvbuf, 1024, 0);
             if (iResult > 0)
@@ -325,7 +443,9 @@ void stopSimulation()
             }
         }
     }
+    terminatePythonProcesses();
 }
+
 void runSimulation()
 {
     std::cout << "Running simulation..." << std::endl;
@@ -549,25 +669,35 @@ float getPredictionFromPython(const std::vector<float> &data, const std::string 
 void processData()
 {
     std::lock_guard<std::mutex> lock(queueMutex);
-    int processedCount = 0;
     while (!dataQueue.empty())
     {
         std::vector<float> data = dataQueue.front();
         dataQueue.pop();
-        if (data.size() >= 17)
+
+        if (data.size() >= 20)
         {
             int fb = static_cast<int>(data[0]);
             int tb = static_cast<int>(data[1]);
             std::pair<int, int> connection(fb, tb);
+
             if ((fb == 1 && (tb == 2 || tb == 3)) ||
                 (fb == 2 && (tb == 1 || tb == 3)) ||
                 (fb == 3 && (tb == 1 || tb == 2)))
             {
+
                 if (fbTbCombinations.find(connection) == fbTbCombinations.end())
                 {
                     fbTbCombinations[connection] = fbTbCombinations.size();
                 }
-                // Process original metrics
+
+                // Create AttackInfo structure
+                AttackInfo attackInfo;
+                attackInfo.none = data[16] > 0.5f;
+                attackInfo.ddos = data[17] > 0.5f;
+                attackInfo.synflood = data[18] > 0.5f;
+                attackInfo.mitm = data[19] > 0.5f;
+
+                // Process metrics
                 for (int i = 0; i < metricLabels.size(); ++i)
                 {
                     std::lock_guard<std::mutex> lock(plotDataMutexes[i]);
@@ -595,46 +725,71 @@ void processData()
                     case 6:
                         value = data[11];
                         break; // Arrival Rate
-                    case 7:
-                        value = data[16];
-                        break; // Attack Information (from simulation)
+                    case 7:    // Attack Type Distribution
+                        if (attackInfo.ddos)
+                            value = 1.0f;
+                        else if (attackInfo.synflood)
+                            value = 2.0f;
+                        else if (attackInfo.mitm)
+                            value = 3.0f;
+                        else
+                            value = 0.0f;
+                        break;
                     default:
                         value = 0.0f;
                     }
                     plotDataArray[i].values[connection].push_back(value);
                 }
+
                 // Process model predictions
                 for (auto &model : availableModels)
                 {
                     if (model.selected)
                     {
-                        float prediction = getPredictionFromPython(data, model.name);
-                        model.plotData[0].values[connection].push_back(prediction);
-                        if (model.plotData[0].values[connection].size() > 1000)
+                        // Create prediction request
+                        json predictionRequest;
+                        predictionRequest["IAT"] = data[2];
+                        predictionRequest["TD"] = data[3];
+                        predictionRequest["Arrival Time"] = data[4];
+                        predictionRequest["PC"] = data[5];
+                        predictionRequest["Packet Size"] = data[6];
+                        predictionRequest["Acknowledgement Packet Size"] = data[7];
+                        predictionRequest["RTT"] = data[8];
+                        predictionRequest["Average Queue Size"] = data[9];
+                        predictionRequest["System Occupancy"] = data[10];
+                        predictionRequest["Arrival Rate"] = data[11];
+                        predictionRequest["Service Rate"] = data[12];
+                        predictionRequest["Packet Dropped"] = data[13];
+                        predictionRequest["attack_none"] = attackInfo.none;
+                        predictionRequest["attack_ddos"] = attackInfo.ddos;
+                        predictionRequest["attack_synflood"] = attackInfo.synflood;
+                        predictionRequest["attack_mitm"] = attackInfo.mitm;
+
+                        std::string jsonStr = predictionRequest.dump();
+                        if (send(model.socket, jsonStr.c_str(), jsonStr.length(), 0) != SOCKET_ERROR)
                         {
-                            model.plotData[0].values[connection].erase(model.plotData[0].values[connection].begin());
+                            char recvbuf[1024];
+                            int iResult = recv(model.socket, recvbuf, 1024, 0);
+                            if (iResult > 0)
+                            {
+                                std::string response(recvbuf, iResult);
+                                json responseJson = json::parse(response);
+                                float prediction = responseJson["prediction"].get<float>();
+                                model.plotData[0].values[connection].push_back(prediction);
+                            }
                         }
                     }
                 }
-                processedCount++;
-                if (processedCount % 100 == 0)
-                {
-                    std::cout << "Processed " << processedCount << " data points" << std::endl;
-                }
             }
-        }
-        else
-        {
-            std::cout << "Received data point with insufficient elements: " << data.size() << std::endl;
         }
     }
 }
 
+// Modify the simulationThread function to correctly pass the attack type:
 void simulationThread()
 {
     try
     {
-        // Prepare arguments for run_simulation
         PyObject *pName, *pModule, *pFunc, *pArgs, *pValue;
         pName = PyUnicode_FromString("simulation_script");
         pModule = PyImport_ImportModule("simulation_script");
@@ -650,8 +805,29 @@ void simulationThread()
         if (pFunc && PyCallable_Check(pFunc))
         {
             pArgs = PyTuple_New(5);
+
+            // Convert traffic type to corresponding AttackType value
+            PyObject *attackType;
+            switch (currentTrafficType)
+            {
+            case TrafficType::NORMAL:
+                attackType = PyLong_FromLong(0);
+                break;
+            case TrafficType::DDOS:
+                attackType = PyLong_FromLong(1);
+                break;
+            case TrafficType::SYN_FLOOD:
+                attackType = PyLong_FromLong(2); // AttackType.SYN_FLOOD
+                break;
+            case TrafficType::MITM_SCADA:
+                attackType = PyLong_FromLong(3);
+                break;
+            default:
+                attackType = PyLong_FromLong(0);
+            }
+
             PyTuple_SetItem(pArgs, 0, PyLong_FromLong(12345)); // port
-            PyTuple_SetItem(pArgs, 1, PyBool_FromLong(includeDOS));
+            PyTuple_SetItem(pArgs, 1, attackType);
             PyTuple_SetItem(pArgs, 2, PyLong_FromLong(totalSimulationTime));
             PyTuple_SetItem(pArgs, 3, PyLong_FromLong(dosAttackTime));
             PyTuple_SetItem(pArgs, 4, PyBool_FromLong(true)); // start_simulation flag
@@ -669,17 +845,10 @@ void simulationThread()
                 Py_DECREF(pValue);
             }
         }
-        else
-        {
-            if (PyErr_Occurred())
-                PyErr_Print();
-            std::cerr << "Cannot find function 'run_simulation'" << std::endl;
-        }
 
         Py_XDECREF(pFunc);
         Py_DECREF(pModule);
 
-        // Process any remaining data in the queue
         while (!dataQueue.empty())
         {
             processData();
@@ -690,32 +859,50 @@ void simulationThread()
     {
         std::cerr << "Exception in simulation thread: " << e.what() << std::endl;
     }
-    catch (...)
-    {
-        std::cerr << "Unknown exception in simulation thread" << std::endl;
-    }
 
     simulationRunning = false;
     simulationEnded = true;
     stopSimulation();
 }
-
 void renderPlots()
 {
     ImPlotFlags flags = ImPlotFlags_NoMouseText;
     ImPlotAxisFlags axes_flags = ImPlotAxisFlags_NoTickLabels;
+
     for (size_t i = 0; i < metricLabels.size(); ++i)
     {
         if (plotVisibility[i])
         {
             ImGui::BeginChild(metricLabels[i].c_str(), ImVec2(0, 250), true);
             ImGui::Text("%s", metricLabels[i].c_str());
+
+            if (i == 7)
+            { // Legend for attack type plot
+                ImGui::ColorButton("##Normal", ATTACK_COLORS[0], 0, ImVec2(15, 15));
+                ImGui::SameLine();
+                ImGui::Text("Normal");
+                ImGui::SameLine(100);
+                ImGui::ColorButton("##DDoS", ATTACK_COLORS[1], 0, ImVec2(15, 15));
+                ImGui::SameLine();
+                ImGui::Text("DDoS");
+                ImGui::SameLine(200);
+                ImGui::ColorButton("##SYN", ATTACK_COLORS[2], 0, ImVec2(15, 15));
+                ImGui::SameLine();
+                ImGui::Text("SYN Flood");
+                ImGui::SameLine(300);
+                ImGui::ColorButton("##MITM", ATTACK_COLORS[3], 0, ImVec2(15, 15));
+                ImGui::SameLine();
+                ImGui::Text("MITM");
+            }
+
             if (ImPlot::BeginPlot(metricLabels[i].c_str(), ImVec2(-1, 200), flags))
             {
                 ImPlot::SetupAxes("Data Point", metricLabels[i].c_str(), axes_flags, axes_flags);
+
                 double y_min = std::numeric_limits<double>::max();
                 double y_max = std::numeric_limits<double>::lowest();
                 double last_x = 0;
+
                 // First pass to determine axis limits
                 for (const auto &[connection, values] : plotDataArray[i].values)
                 {
@@ -726,30 +913,64 @@ void renderPlots()
                         last_x = std::max(last_x, static_cast<double>(values.size()));
                     }
                 }
-                // padding to y-axis limits
-                double y_range = y_max - y_min;
-                y_min -= y_range * 0.1;
-                y_max += y_range * 0.1;
+
+                if (i == 7)
+                { // Attack Type plot
+                    y_min = -0.2;
+                    y_max = 1.2;
+                }
+                else
+                {
+                    // padding to y-axis limits
+                    double y_range = y_max - y_min;
+                    y_min -= y_range * 0.1;
+                    y_max += y_range * 0.1;
+                }
                 ImPlot::SetupAxisLimits(ImAxis_X1, 0, last_x, ImGuiCond_Always);
                 ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
-                // Plot the lines
+
+                // Plot each connection's data
                 for (const auto &[connection, values] : plotDataArray[i].values)
                 {
                     if (!values.empty())
                     {
-                        std::vector<double> x_data(values.size());
-                        std::vector<double> y_data(values.size());
-                        for (size_t j = 0; j < values.size(); ++j)
-                        {
-                            x_data[j] = static_cast<double>(j);
-                            y_data[j] = static_cast<double>(values[j]);
-                        }
                         std::string label = "FB" + std::to_string(connection.first) +
                                             " -> TB" + std::to_string(connection.second);
-                        ImPlot::SetNextLineStyle(colors[fbTbCombinations[connection] % MAX_LINES]);
-                        ImPlot::PlotLine(label.c_str(), x_data.data(), y_data.data(), values.size());
+
+                        if (i == 7)
+                        { // Attack Type plot
+                            // Separate points by attack type
+                            std::vector<std::vector<double>> x_points(4); // One for each attack type
+                            std::vector<std::vector<double>> y_points(4);
+
+                            for (size_t j = 0; j < values.size(); ++j)
+                            {
+                                int attackType = static_cast<int>(values[j]);
+                                if (attackType >= 0 && attackType < 4)
+                                {
+                                    x_points[attackType].push_back(static_cast<double>(j));
+                                    y_points[attackType].push_back(attackType == 0 ? 0.0 : 1.0);
+                                }
+                            }
+
+                            // Plot points for each attack type within this connection
+                            for (int type = 0; type < 4; ++type)
+                            {
+                                if (!x_points[type].empty())
+                                {
+                                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Square, 4, ATTACK_COLORS[type], IMPLOT_AUTO, ATTACK_COLORS[type]);
+                                    ImPlot::PlotScatter(label.c_str(), x_points[type].data(), y_points[type].data(), x_points[type].size());
+                                }
+                            }
+                        }
+                        else
+                        { // Other metrics - normal line plots
+                            ImPlot::SetNextLineStyle(colors[fbTbCombinations[connection] % MAX_LINES]);
+                            ImPlot::PlotLine(label.c_str(), values.data(), values.size());
+                        }
                     }
                 }
+
                 ImPlot::EndPlot();
             }
             ImGui::EndChild();
@@ -760,6 +981,7 @@ void renderModelPlots()
 {
     ImPlotFlags flags = ImPlotFlags_NoMouseText;
     ImPlotAxisFlags axes_flags = ImPlotAxisFlags_NoTickLabels;
+
     for (const auto &model : availableModels)
     {
         if (model.selected)
@@ -767,50 +989,129 @@ void renderModelPlots()
             std::string plotLabel = model.name + " Prediction";
             ImGui::BeginChild(plotLabel.c_str(), ImVec2(0, 250), true);
             ImGui::Text("%s", plotLabel.c_str());
+
+            // Draw legend
+            ImGui::ColorButton("##Normal", ATTACK_COLORS[0], 0, ImVec2(15, 15));
+            ImGui::SameLine();
+            ImGui::Text("Normal");
+            ImGui::SameLine(100);
+            ImGui::ColorButton("##DDoS", ATTACK_COLORS[1], 0, ImVec2(15, 15));
+            ImGui::SameLine();
+            ImGui::Text("DDoS");
+            ImGui::SameLine(200);
+            ImGui::ColorButton("##SYN", ATTACK_COLORS[2], 0, ImVec2(15, 15));
+            ImGui::SameLine();
+            ImGui::Text("SYN Flood");
+            ImGui::SameLine(300);
+            ImGui::ColorButton("##MITM", ATTACK_COLORS[3], 0, ImVec2(15, 15));
+            ImGui::SameLine();
+            ImGui::Text("MITM");
+
             if (ImPlot::BeginPlot(plotLabel.c_str(), ImVec2(-1, 200), flags))
             {
-                ImPlot::SetupAxes("Data Point", "Prediction", axes_flags, axes_flags);
-                double y_min = std::numeric_limits<double>::max();
-                double y_max = std::numeric_limits<double>::lowest();
+                ImPlot::SetupAxes("Data Point", "Attack Detection", axes_flags, axes_flags);
+                ImPlot::SetupAxisLimits(ImAxis_Y1, -0.2, 1.2, ImGuiCond_Always);
+
+                // Find the maximum x value for proper x-axis scaling
                 double last_x = 0;
-                // First pass to determine axis limits
                 for (const auto &[connection, values] : model.plotData[0].values)
                 {
                     if (!values.empty())
                     {
-                        y_min = std::min(y_min, static_cast<double>(*std::min_element(values.begin(), values.end())));
-                        y_max = std::max(y_max, static_cast<double>(*std::max_element(values.begin(), values.end())));
                         last_x = std::max(last_x, static_cast<double>(values.size()));
                     }
                 }
-                // padding to y-axis limits
-                double y_range = y_max - y_min;
-                y_min -= y_range * 0.1;
-                y_max += y_range * 0.1;
                 ImPlot::SetupAxisLimits(ImAxis_X1, 0, last_x, ImGuiCond_Always);
-                ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
+
                 for (const auto &[connection, values] : model.plotData[0].values)
                 {
                     if (!values.empty())
                     {
-                        std::vector<double> x_data(values.size());
-                        std::vector<double> y_data(values.size());
+                        std::string label = "FB" + std::to_string(connection.first) +
+                                            " -> TB" + std::to_string(connection.second);
+                        std::vector<double> normal_x, normal_y; // For predictions < 0.5
+                        std::vector<double> attack_x, attack_y; // For predictions >= 0.5
+
                         for (size_t j = 0; j < values.size(); ++j)
                         {
-                            x_data[j] = static_cast<double>(j);
-                            y_data[j] = static_cast<double>(values[j]);
+                            if (values[j] < 0.5)
+                            {
+                                normal_x.push_back(static_cast<double>(j));
+                                normal_y.push_back(0.0);
+                            }
+                            else
+                            {
+                                attack_x.push_back(static_cast<double>(j));
+                                attack_y.push_back(1.0);
+                            }
                         }
-                        std::string label = "FB" + std::to_string(connection.first) + " -> TB" + std::to_string(connection.second);
-                        ImPlot::SetNextLineStyle(colors[fbTbCombinations[connection] % MAX_LINES]);
-                        ImPlot::PlotLine(label.c_str(), x_data.data(), y_data.data(), values.size());
+
+                        // Plot normal traffic points (grey)
+                        if (!normal_x.empty())
+                        {
+                            ImPlot::SetNextMarkerStyle(ImPlotMarker_Square, 4, ATTACK_COLORS[0], IMPLOT_AUTO, ATTACK_COLORS[0]);
+                            ImPlot::PlotScatter(label.c_str(), normal_x.data(), normal_y.data(), normal_x.size());
+                        }
+
+                        if (!attack_x.empty())
+                        {
+                            ImVec4 attackColor;
+                            switch (currentTrafficType)
+                            {
+                            case TrafficType::NORMAL:
+                                attackColor = ATTACK_COLORS[0]; // Grey
+                                break;
+                            case TrafficType::DDOS:
+                                attackColor = ATTACK_COLORS[1]; // Red
+                                break;
+                            case TrafficType::SYN_FLOOD:
+                                attackColor = ATTACK_COLORS[2]; // Red
+                                break;
+                            case TrafficType::MITM_SCADA:
+                                attackColor = ATTACK_COLORS[3]; // Orange
+                                break;
+                            default:
+                                attackColor = ATTACK_COLORS[0];
+                            }
+                            ImPlot::SetNextMarkerStyle(ImPlotMarker_Square, 4, attackColor, IMPLOT_AUTO, attackColor);
+                            // Use same label to group points under one legend entry
+                            ImPlot::PlotScatter(label.c_str(), attack_x.data(), attack_y.data(), attack_x.size());
+                        }
                     }
                 }
                 ImPlot::EndPlot();
             }
+
+            // Add model accuracy information
+            ImGui::Text("Detection Accuracy by Attack Type:");
+            ImGui::Indent();
+            for (const auto &[attackType, accuracy] : model.attackAccuracy)
+            {
+                const char *attackName = "";
+                switch (attackType)
+                {
+                case AttackType::NONE:
+                    attackName = "Normal";
+                    break;
+                case AttackType::DDOS:
+                    attackName = "DDoS";
+                    break;
+                case AttackType::SYN_FLOOD:
+                    attackName = "SYN Flood";
+                    break;
+                case AttackType::MITM_SCADA:
+                    attackName = "MITM";
+                    break;
+                }
+                ImGui::Text("%s: %.2f%%", attackName, accuracy * 100.0f);
+            }
+            ImGui::Unindent();
+
             ImGui::EndChild();
         }
     }
 }
+
 void receiveDataFromPython()
 {
     WSADATA wsaData;
@@ -819,17 +1120,28 @@ void receiveDataFromPython()
         std::cerr << "WSAStartup failed.\n";
         return;
     }
-    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    
+    listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listenSocket == INVALID_SOCKET)
     {
         std::cerr << "Error creating socket: " << WSAGetLastError() << std::endl;
         WSACleanup();
         return;
     }
+
+    // Set socket to non-blocking mode
+    u_long mode = 1;
+    ioctlsocket(listenSocket, FIONBIO, &mode);
+
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_port = htons(12345);
+
+    // Add SO_REUSEADDR option
+    int opt = 1;
+    setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt));
+
     if (bind(listenSocket, (SOCKADDR *)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
     {
         std::cerr << "Bind failed with error: " << WSAGetLastError() << std::endl;
@@ -837,6 +1149,7 @@ void receiveDataFromPython()
         WSACleanup();
         return;
     }
+
     if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR)
     {
         std::cerr << "Listen failed with error: " << WSAGetLastError() << std::endl;
@@ -844,71 +1157,106 @@ void receiveDataFromPython()
         WSACleanup();
         return;
     }
-    while (receiverRunning)
+
+    std::vector<SOCKET> clientSockets;
+
+    while (!shouldExit)
     {
-        SOCKET clientSocket = accept(listenSocket, NULL, NULL);
-        if (clientSocket == INVALID_SOCKET)
+        if (receiverRunning)
         {
-            std::cerr << "Accept failed: " << WSAGetLastError() << std::endl;
-            closesocket(listenSocket);
-            WSACleanup();
-            return;
-        }
-        while (receiverRunning)
-        {
-            char recvbuf[1024];
-            int recvbuflen = 1024;
-            int iResult = recv(clientSocket, recvbuf, recvbuflen, 0);
-            if (iResult == 0)
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(listenSocket, &readSet);
+
+            for (const auto &sock : clientSockets)
             {
-                // Socket closed by the other side
-                std::cout << "Connection closed by Python" << std::endl;
-                break;
+                FD_SET(sock, &readSet);
             }
-            else if (iResult < 0)
+
+            // Set timeout for select
+            timeval timeout;
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 100000; // 100ms timeout
+
+            int result = select(0, &readSet, nullptr, nullptr, &timeout);
+
+            if (result > 0)
             {
-                // Error occurred during recv
-                int errorCode = WSAGetLastError();
-                std::cerr << "recv failed with error: " << errorCode << std::endl;
-                break;
-            }
-            else
-            {
-                std::string receivedData(recvbuf, iResult);
-                try
+                // Check for new connections
+                if (FD_ISSET(listenSocket, &readSet))
                 {
-                    json j = json::parse(receivedData);
-                    std::vector<float> dataPoint;
-                    for (const auto &[key, value] : j.items())
+                    SOCKET clientSocket = accept(listenSocket, NULL, NULL);
+                    if (clientSocket != INVALID_SOCKET)
                     {
-                        if (value.is_number())
+                        clientSockets.push_back(clientSocket);
+                    }
+                }
+
+                // Check existing connections
+                for (auto it = clientSockets.begin(); it != clientSockets.end();)
+                {
+                    if (FD_ISSET(*it, &readSet))
+                    {
+                        char recvbuf[1024];
+                        int iResult = recv(*it, recvbuf, 1024, 0);
+
+                        if (iResult > 0)
                         {
-                            dataPoint.push_back(value.get<float>());
+                            // Process received data
+                            std::string receivedData(recvbuf, iResult);
+                            try
+                            {
+                                json j = json::parse(receivedData);
+                                std::vector<float> dataPoint;
+                                for (const auto &[key, value] : j.items())
+                                {
+                                    if (value.is_number())
+                                    {
+                                        dataPoint.push_back(value.get<float>());
+                                    }
+                                    else
+                                    {
+                                        dataPoint.push_back(0.0f);
+                                    }
+                                }
+                                std::lock_guard<std::mutex> lock(queueMutex);
+                                dataQueue.push(dataPoint);
+                            }
+                            catch (const json::parse_error &e)
+                            {
+                                std::cerr << "JSON parse error: " << e.what() << std::endl;
+                            }
+                            ++it;
                         }
                         else
                         {
-                            dataPoint.push_back(0.0f); // Default value for non-numeric data
+                            // Connection closed or error
+                            closesocket(*it);
+                            it = clientSockets.erase(it);
                         }
                     }
-                    std::lock_guard<std::mutex> lock(queueMutex);
-                    dataQueue.push(dataPoint);
-                    // std::cout << "Received data point with " << dataPoint.size() << " elements" << std::endl;
-                    // std::cout << "CPP DATA ENQUEUE [ ";
-                    // for (const auto &value : dataPoint)
-                    //{
-                    //     std::cout << value << " ";
-                    // }
-                    // std::cout << "]" << std::endl;
-                }
-                catch (const json::parse_error &e)
-                {
-                    std::cerr << "JSON parse error: " << e.what() << std::endl;
+                    else
+                    {
+                        ++it;
+                    }
                 }
             }
         }
-        closesocket(clientSocket);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    closesocket(listenSocket);
+
+    // Cleanup client sockets
+    for (SOCKET sock : clientSockets)
+    {
+        closesocket(sock);
+    }
+
+    if (listenSocket != INVALID_SOCKET)
+    {
+        closesocket(listenSocket);
+        listenSocket = INVALID_SOCKET;
+    }
+
     WSACleanup();
 }
 
@@ -1027,14 +1375,68 @@ void saveModelAndStatistics(const ModelInfo &model, const json &stats)
     sqlite3_finalize(stmt);
     sqlite3_close(db);
 }
+
+void windowCloseCallback(GLFWwindow *window)
+{
+    if (simulationRunning || !simulationEnded)
+    {
+        stopSimulation();
+    }
+
+    shouldExit = true;
+    receiverRunning = false;
+    applicationClosing = true;
+    stopSimulationRequested = true;
+
+    // Force cleanup of any remaining Python processes
+    terminatePythonProcesses();
+}
+
+float globalScale = 1.0f;
+bool initialScaleSet = false;
+
+void setDefaultScale(GLFWwindow *window)
+{
+    // Get the primary monitor
+    GLFWmonitor *monitor = glfwGetPrimaryMonitor();
+    if (monitor)
+    {
+        // Get the content scale for the primary monitor
+        float xscale, yscale;
+        glfwGetMonitorContentScale(monitor, &xscale, &yscale);
+
+        // Use the larger scale factor
+        globalScale = std::max(xscale, yscale);
+
+        // Get framebuffer size and window size to calculate pixel ratio
+        int fbWidth, fbHeight, winWidth, winHeight;
+        glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
+        glfwGetWindowSize(window, &winWidth, &winHeight);
+        float pixelRatio = static_cast<float>(fbWidth) / winWidth;
+
+        // Adjust scale based on pixel ratio
+        globalScale *= pixelRatio;
+
+        // Clamp to reasonable values
+        globalScale = std::max(1.0f, std::min(globalScale, 3.0f));
+    }
+}
+
 int main(int, char **)
 {
     // Initialize GLFW and create window
     if (!glfwInit())
         return 1;
+
     GLFWwindow *window = glfwCreateWindow(1280, 720, "Real-time Network Visualization", NULL, NULL);
     if (window == NULL)
+    {
+        glfwTerminate();
         return 1;
+    }
+
+    // Set window close callback before making context current
+    glfwSetWindowCloseCallback(window, windowCloseCallback);
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable vsync
 
@@ -1052,21 +1454,35 @@ int main(int, char **)
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
+    // Initialize WSA for Windows sockets
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        std::cerr << "WSAStartup failed.\n";
+        return 1;
+    }
+
     // Initialize Python
     initPython();
     initAvailableModels();
 
+    // Initialize application state
+    shouldExit = false;
+    applicationClosing = false;
+    simulationRunning = false;
+    simulationEnded = false;
+    receiverRunning = true;
+
     // Start the receiver thread for simulation data
     std::thread receiverThread(receiveDataFromPython);
 
-    // Main loop
+    // Get executable path
     char exePath[MAX_PATH];
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
     std::filesystem::path executablePath = std::filesystem::path(exePath).parent_path();
 
     // Main loop
-    simulationEnded = false;
-    while (!glfwWindowShouldClose(window))
+    while (!shouldExit && !glfwWindowShouldClose(window))
     {
         glfwPollEvents();
 
@@ -1083,21 +1499,21 @@ int main(int, char **)
                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
                          ImGuiWindowFlags_NoNavFocus);
 
+        // Model Loading Controls
         if (ImGui::Button("Load Model"))
         {
             loadModel();
         }
-
+        ImGui::SameLine();
         if (fileExists("network_traffic.csv"))
         {
             if (ImGui::Button("Train Model"))
             {
-
                 trainModel(std::filesystem::absolute("network_traffic.csv").string());
             }
         }
 
-        // Model selection checkboxes
+        // Model Selection
         {
             std::lock_guard<std::mutex> lock(modelsMutex);
             ImGui::Text("Available Models:");
@@ -1107,25 +1523,35 @@ int main(int, char **)
             }
         }
 
+        // Simulation Parameters
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Text("Simulation Parameters:");
         ImGui::InputInt("Total Simulation Time (s)", &totalSimulationTime);
-
         if (includeDOS)
         {
-            ImGui::InputInt("DOS Attack Time (s)", &dosAttackTime);
-            // Ensure DOS attack time is not longer than total simulation time
+            ImGui::InputInt("Attack Duration (s)", &dosAttackTime);
             if (dosAttackTime > totalSimulationTime)
                 dosAttackTime = totalSimulationTime;
         }
 
-        // Simulation control buttons
+        // Simulation controls
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("Simulation Controls:");
         ImGui::SameLine();
-        if (ImGui::Button(includeDOS ? "Switch to Normal Traffic" : "Switch to DOS Traffic"))
+
+        const char *trafficTypes[] = {
+            "Normal Traffic",
+            "DDoS Traffic",
+            "SYN Flood Traffic",
+            "MITM Traffic"};
+
+        static int currentTrafficIndex = 0;
+        if (ImGui::Combo("Traffic Type", &currentTrafficIndex, trafficTypes, IM_ARRAYSIZE(trafficTypes)))
         {
-            includeDOS = !includeDOS;
+            currentTrafficType = static_cast<TrafficType>(currentTrafficIndex);
         }
         ImGui::SameLine();
 
@@ -1145,24 +1571,39 @@ int main(int, char **)
                     simulationRunning = true;
                     stopSimulationRequested = false;
                     std::lock_guard<std::mutex> lock(modelsMutex);
+
+                    // Clear any existing Python script threads
+                    for (auto &thread : pythonScriptThreads)
+                    {
+                        if (thread.joinable())
+                        {
+                            thread.join();
+                        }
+                    }
+                    pythonScriptThreads.clear();
+
                     for (auto &model : availableModels)
                     {
                         if (model.selected)
                         {
-                            // Start the Python script for this model
-                            std::thread([&model, &executablePath]()
-                                        {
-                                std::filesystem::path scriptPath = executablePath / "prediction_script.py";
-                                std::string modelPath = model.path.empty() ? (executablePath / model.name).string() : model.path;
-                                std::string command = "python \"" + scriptPath.string() + "\" \"" + modelPath + "\" " + std::to_string(model.port);
-                                std::cout << "Executing command: " << command << std::endl;
-                                std::system(command.c_str()); })
-                                .detach();
+                            pythonScriptThreads.emplace_back([&model, &executablePath]()
+                                                             {
+                        if (!applicationClosing)
+                        {
+                            std::filesystem::path scriptPath = executablePath / "prediction_script.py";
+                            std::string modelPath = model.path.empty() ? 
+                                (executablePath / model.name).string() : model.path;
+                            std::string command = "python \"" + scriptPath.string() + 
+                                "\" \"" + modelPath + "\" " + std::to_string(model.port);
+                            std::cout << "Executing command: " << command << std::endl;
+                            std::system(command.c_str());
+                        } });
                         }
                     }
+
                     // Wait for Python scripts to start
                     std::this_thread::sleep_for(std::chrono::seconds(2));
-                    // Initialize sockets for selected models
+
                     if (!initPredictionSocket())
                     {
                         std::cerr << "Failed to initialize prediction sockets. Stopping simulation." << std::endl;
@@ -1170,23 +1611,25 @@ int main(int, char **)
                     }
                     else
                     {
-                        // Start the simulation thread
                         std::thread(simulationThread).detach();
                     }
                 }
             }
         }
+        // Simulation Results
         if (simulationEnded || (stopSimulationRequested && !simulationRunning))
         {
             ImGui::Text("Simulation Ended");
-            ImGui::Spacing();
-            if (ImGui::Button("Save Model and Statistics"))
+
+            if (ImGui::Button("Save Results"))
             {
                 for (const auto &stats : modelStats)
                 {
                     auto it = std::find_if(availableModels.begin(), availableModels.end(),
                                            [&stats](const ModelInfo &model)
-                                           { return model.name == stats["model_name"]; });
+                                           {
+                                               return model.name == stats["model_name"];
+                                           });
                     if (it != availableModels.end())
                     {
                         saveModelAndStatistics(*it, stats);
@@ -1194,34 +1637,114 @@ int main(int, char **)
                 }
                 ImGui::OpenPopup("Save Confirmation");
             }
+
             if (ImGui::BeginPopupModal("Save Confirmation", NULL, ImGuiWindowFlags_AlwaysAutoResize))
             {
-                ImGui::Text("Models and statistics saved successfully.");
+                ImGui::Text("Results saved successfully");
                 if (ImGui::Button("OK", ImVec2(120, 0)))
                 {
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::EndPopup();
             }
-            ImGui::Text("Model Statistics:");
-            for (const auto &stats : modelStats)
+
+            if (ImGui::BeginTable("Model Statistics", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
             {
-                ImGui::Text("Model: %s", stats["model_name"].get<std::string>().c_str());
-                ImGui::Text("Total Predictions: %d", stats["total_predictions"].get<int>());
-                ImGui::Text("Accuracy: %.4f", stats["accuracy"].get<double>());
-                ImGui::Text("Precision: %.4f", stats["precision"].get<double>());
-                ImGui::Text("Recall: %.4f", stats["recall"].get<double>());
-                ImGui::Text("F1 Score: %.4f", stats["f1_score"].get<double>());
+                // Set up the table headers
+                ImGui::TableSetupColumn("Model Name");
+                ImGui::TableSetupColumn("Total Predictions");
+                ImGui::TableSetupColumn("Accuracy");
+                ImGui::TableSetupColumn("Precision");
+                ImGui::TableSetupColumn("Recall");
+                ImGui::TableSetupColumn("F1 Score");
+                ImGui::TableSetupColumn("Avg Time (ms)");
+                ImGui::TableHeadersRow();
+
+                // Add rows for each model
+                for (const auto &stats : modelStats)
+                {
+                    ImGui::TableNextRow();
+
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%s", stats["model_name"].get<std::string>().c_str());
+
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%d", stats["total_predictions"].get<int>());
+
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.4f", stats["accuracy"].get<double>());
+
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%.4f", stats["precision"].get<double>());
+
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%.4f", stats["recall"].get<double>());
+
+                    ImGui::TableSetColumnIndex(5);
+                    ImGui::Text("%.4f", stats["f1_score"].get<double>());
+
+                    ImGui::TableSetColumnIndex(6);
+                    ImGui::Text("%.3f", stats["avg_prediction_time"].get<double>());
+                }
+                ImGui::EndTable();
+            }
+
+            // Display attack-specific metrics in a separate table
+            if (!modelStats.empty())
+            {
                 ImGui::Spacing();
+                ImGui::Text("Attack-Specific Metrics");
+
+                if (ImGui::BeginTable("Attack Metrics", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+                {
+                    // Set up the table headers
+                    ImGui::TableSetupColumn("Model Name");
+                    ImGui::TableSetupColumn("Attack Type");
+                    ImGui::TableSetupColumn("Precision");
+                    ImGui::TableSetupColumn("Recall");
+                    ImGui::TableSetupColumn("F1 Score");
+                    ImGui::TableHeadersRow();
+
+                    // Add rows for each model and attack type
+                    for (const auto &stats : modelStats)
+                    {
+                        const auto &attack_metrics = stats["attack_metrics"];
+                        std::string model_name = stats["model_name"].get<std::string>();
+
+                        for (const auto &[attack_type, metrics] : attack_metrics.items())
+                        {
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%s", model_name.c_str());
+
+                            ImGui::TableSetColumnIndex(1);
+                            // Capitalize first letter of attack type
+                            std::string display_attack = attack_type;
+                            if (!display_attack.empty())
+                                display_attack[0] = std::toupper(display_attack[0]);
+                            ImGui::Text("%s", display_attack.c_str());
+
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%.4f", metrics["precision"].get<double>());
+
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::Text("%.4f", metrics["recall"].get<double>());
+
+                            ImGui::TableSetColumnIndex(4);
+                            ImGui::Text("%.4f", metrics["f1_score"].get<double>());
+                        }
+                    }
+                    ImGui::EndTable();
+                }
             }
         }
 
-        // Metric plot visibility checkboxes
+        // Plot Controls
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::Text("Metric Plots:");
-        ImGui::Columns(2, nullptr, false);
+        ImGui::Text("Metrics Display:");
+        ImGui::Columns(2, "MetricsColumns");
         for (size_t i = 0; i < metricLabels.size(); ++i)
         {
             bool isVisible = plotVisibility[i];
@@ -1234,13 +1757,13 @@ int main(int, char **)
         }
         ImGui::Columns(1);
 
-        // Process data if simulation is running
+        // Process and Render Data
         if (simulationRunning)
         {
             processData();
         }
 
-        // Always render plots, even if simulation has ended
+        // Render Plots
         renderPlots();
         renderModelPlots();
 
@@ -1256,23 +1779,101 @@ int main(int, char **)
         glfwSwapBuffers(window);
     }
 
-    // Cleanup
+    // Begin cleanup sequence
+    std::cout << "Starting cleanup..." << std::endl;
+
+    shouldExit = true;
+    applicationClosing = true;
     simulationRunning = false;
     receiverRunning = false;
+    stopSimulationRequested = true;
+
+    // Stop simulation if running
+    if (!simulationEnded)
+    {
+        std::cout << "Stopping simulation..." << std::endl;
+        stopSimulation();
+    }
+
+    std::cout << "Terminating Python processes..." << std::endl;
+    terminatePythonProcesses();
+
+    // Close all model sockets
+    std::cout << "Closing model sockets..." << std::endl;
+    for (auto &model : availableModels)
+    {
+        if (model.socket != INVALID_SOCKET)
+        {
+            shutdown(model.socket, SD_BOTH);
+            closesocket(model.socket);
+            model.socket = INVALID_SOCKET;
+        }
+    }
+
+    // Wait for Python script threads
+    std::cout << "Waiting for Python threads..." << std::endl;
+    for (auto &thread : pythonScriptThreads)
+    {
+        if (thread.joinable())
+        {
+            std::thread timeoutThread([&thread]()
+                                      { thread.join(); });
+
+            auto start = std::chrono::steady_clock::now();
+            while (timeoutThread.joinable())
+            {
+                if (std::chrono::steady_clock::now() - start > std::chrono::seconds(3))
+                {
+                    std::cout << "Thread join timed out" << std::endl;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+    pythonScriptThreads.clear();
+
+    // Close listen socket
+    std::cout << "Closing listen socket..." << std::endl;
+    if (listenSocket != INVALID_SOCKET)
+    {
+        shutdown(listenSocket, SD_BOTH);
+        closesocket(listenSocket);
+        listenSocket = INVALID_SOCKET;
+    }
+
+    // Wait for receiver thread
+    std::cout << "Waiting for receiver thread..." << std::endl;
     if (receiverThread.joinable())
     {
-        receiverThread.join();
+        std::thread timeoutThread([&receiverThread]()
+                                  { receiverThread.join(); });
+
+        auto start = std::chrono::steady_clock::now();
+        while (timeoutThread.joinable())
+        {
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(3))
+            {
+                std::cout << "Receiver thread join timed out" << std::endl;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
-    closeModelSockets();
+
+    // Final cleanup
+    std::cout << "Performing final cleanup..." << std::endl;
+    WSACleanup();
+    Py_Finalize();
+
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     ImPlot::DestroyContext();
+
     glfwDestroyWindow(window);
     glfwTerminate();
 
-    // Finalize Python
-    Py_Finalize();
-
+    std::cout << "Cleanup complete." << std::endl;
     return 0;
 }

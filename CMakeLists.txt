@@ -1,15 +1,28 @@
-cmake_minimum_required(VERSION 3.10)
-project(NetworkVisualization)
+cmake_minimum_required(VERSION 3.15)
+project(NetworkVisualization VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
-
-# Use vcpkg toolchain file if VCPKG_ROOT is set
-if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
-  set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
-      CACHE STRING "")
+# Ensure proper Visual Studio configuration
+if(MSVC)
+    add_compile_options(/W4 /MP)
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 endif()
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+# Set C++ standard and enforce it
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Enable folder organization in IDE
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
+# Handle vcpkg integration
+if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "Vcpkg toolchain file")
+endif()
+
+# Find required packages with version checks
+find_package(Python3 3.11 COMPONENTS Interpreter Development REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
@@ -17,14 +30,30 @@ find_package(implot CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(SQLite3 REQUIRED)
 
-# Include directories
-include_directories(${Python3_INCLUDE_DIRS})
-include_directories(${SQLite3_INCLUDE_DIRS})
+# Define source files
+set(SOURCES
+    main.cpp
+    # Add other source files here
+)
 
-add_executable(NetworkVisualization main.cpp)
+# Create executable
+add_executable(${PROJECT_NAME} ${SOURCES})
+
+# Set output directories
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+)
+
+# Include directories
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${Python3_INCLUDE_DIRS}
+    ${SQLite3_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 
 # Link libraries
-target_link_libraries(NetworkVisualization PRIVATE
+target_link_libraries(${PROJECT_NAME} PRIVATE
     Python3::Python
     OpenGL::GL
     glfw
@@ -36,51 +65,57 @@ target_link_libraries(NetworkVisualization PRIVATE
     comctl32
 )
 
-add_custom_command(TARGET NetworkVisualization POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
+# Copy Python runtime
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${Python3_RUNTIME_LIBRARY_RELEASE}
-        $<TARGET_FILE_DIR:NetworkVisualization>
-)
-# Copy Python script to output directory
-add_custom_command(TARGET NetworkVisualization POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_SOURCE_DIR}/simulation_script.py
-        $<TARGET_FILE_DIR:NetworkVisualization>/simulation_script.py
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>
 )
 
-add_custom_command(TARGET NetworkVisualization POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_SOURCE_DIR}/prediction_script.py
-        $<TARGET_FILE_DIR:NetworkVisualization>/prediction_script.py
+# Function to copy files with error checking
+function(copy_project_file filename)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/${filename}")
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/${filename}"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>/${filename}"
+            COMMENT "Copying ${filename}"
+        )
+    else()
+        message(WARNING "Required file not found: ${filename}")
+    endif()
+endfunction()
+
+# Copy required Python scripts and models
+set(REQUIRED_FILES
+    simulation_script.py
+    prediction_script.py
+    decision_tree_model.pkl
+    isolation_forest_model.pkl
+    random_forest_model.pkl
+    kmeans_model.pkl
+    SimComponents.py
 )
 
-add_custom_command(TARGET NetworkVisualization POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_SOURCE_DIR}/decision_tree_model.pkl
-        $<TARGET_FILE_DIR:NetworkVisualization>/decision_tree_model.pkl
-)
+foreach(file ${REQUIRED_FILES})
+    copy_project_file(${file})
+endforeach()
 
-add_custom_command(TARGET NetworkVisualization POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_SOURCE_DIR}/isolation_forest_model.pkl
-        $<TARGET_FILE_DIR:NetworkVisualization>/isolation_forest_model.pkl
-)
-
-add_custom_command(TARGET NetworkVisualization POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_SOURCE_DIR}/random_forest_model.pkl
-        $<TARGET_FILE_DIR:NetworkVisualization>/random_forest_model.pkl
-)
-
-add_custom_command(TARGET NetworkVisualization POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_SOURCE_DIR}/SimComponents.py
-        $<TARGET_FILE_DIR:NetworkVisualization>/SimComponents.py
-)
-
-# Set PYTHONPATH environment variable
+# Set PYTHONPATH
 if(WIN32)
-  set_property(TARGET NetworkVisualization PROPERTY VS_DEBUGGER_ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}")
+    set_property(TARGET ${PROJECT_NAME} PROPERTY 
+        VS_DEBUGGER_ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}")
 else()
-  set_property(TARGET NetworkVisualization PROPERTY ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}")
+    set_property(TARGET ${PROJECT_NAME} PROPERTY 
+        ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}")
 endif()
+
+# Installation rules
+install(TARGETS ${PROJECT_NAME}
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+# Copy dependencies to install directory
+install(FILES ${REQUIRED_FILES} DESTINATION bin)
